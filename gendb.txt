@@ -1,0 +1,214 @@
+USE [SQLPresentation]
+GO
+/****** Object:  StoredProcedure [Mock].[usp_PopulateDb]    Script Date: 6/13/2013 10:30:16 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+ALTER PROCEDURE [Mock].[usp_PopulateDb] AS
+BEGIN
+
+SET NOCOUNT ON
+
+---------------------------------------
+---- DELETE EXISTING DATA -------------
+---------------------------------------
+
+DELETE FROM Sale.Receipt_Item;
+DELETE FROM Sale.Receipt;
+DELETE FROM Customer.PhoneNumber;
+DELETE FROM Customer.Customer;
+DELETE FROM Mock.State_Weight;
+DELETE FROM Mock.Product_Weight;
+DELETE FROM Product.Item;
+
+
+---------------------------------------
+---- GENERATE NEW WEIGHTS -------------
+---------------------------------------
+
+-- Some products are more popular than others
+INSERT INTO Mock.Product_Weight
+	(ProductId, Weight)
+SELECT
+	ProductId,
+	dbo.GetRandomInt(1,20)
+FROM Product.Product;
+
+
+-- Some states have more people using our store than others
+INSERT INTO Mock.State_Weight
+	(StateId, Weight)
+SELECT
+	StateId,
+	dbo.GetRandomInt(1,20)
+FROM Customer.State;
+
+
+-- Minnesota always loves us...
+UPDATE Mock.State_Weight 
+SET Weight = 50 
+WHERE StateId = 'MN';
+
+-- Wisconsin is close behind...
+UPDATE Mock.State_Weight
+SET	Weight = 30
+WHERE StateId = 'WI';
+
+
+
+
+
+---------------------------------------
+---- INVENTORY CREATION ---------------
+---------------------------------------
+
+-- Insert variable number of items for each product
+WITH Products AS
+(
+	SELECT
+		ProductId,
+		ItemCount = dbo.GetRandomInt(20,50)
+	FROM Product.Product
+)
+INSERT INTO Product.Item
+	(ProductId, SerialNumber, Status)
+SELECT
+	Products.ProductId,
+	NewId(),
+	1
+FROM Products
+JOIN (SELECT i FROM dbo.GetIntList(1,100,1)) Temp ON i < Products.ItemCount
+ORDER BY ProductId;
+
+
+
+
+---------------------------------------
+---- CUSTOMER CREATION ----------------
+---------------------------------------
+
+-- Insert customer name/state data
+-- Customers will be assigned to each state by randomly generating a number for each
+-- customer that is between 1 and the sum of the weights for each state. Each state
+-- has a min and max value which the customers' random number will fall within. There may
+-- be nicer ways to do this but this will suffice for the purposes of this demonstration.
+
+WITH
+	-- Get min and max value for each state. Use running totals by partitioning SUM
+	-- over StateId AND MAGIC ?!?!?!?!?!?!???$#$%@#^$%^&%^%#
+	States AS
+	(
+		SELECT
+			State.StateId,
+			StateWeight.Weight,
+			StartValue = SUM(StateWeight.Weight) OVER (ORDER BY State.StateId) - StateWeight.Weight + 1,
+			EndValue = SUM(StateWeight.Weight) OVER (ORDER BY State.StateId)
+		FROM Customer.State State
+		JOIN Mock.State_Weight StateWeight ON StateWeight.StateId = State.StateId
+	),
+	
+	-- Grab some random first names from the mock database and generate random numbers
+	-- to assign these names to states and referring customers
+	FirstNames AS
+	(
+		SELECT TOP 2000 
+			Data,
+			RowNumber = ROW_NUMBER() OVER(ORDER BY NewId()),
+			RandomStateNumber = dbo.GetRandomInt(1, (SELECT SUM(Weight) FROM States))
+		FROM Mock.String
+		WHERE DataType = 'FN'
+	),
+
+	-- Get random last names; to be paired with first name later on
+	LastNames AS
+	(
+		SELECT TOP 2000 
+			Data,
+			RowNumber = ROW_NUMBER() OVER(ORDER BY NewId())
+		FROM Mock.String
+		WHERE DataType = 'LN'
+	)
+-- Insert rows into Customer for first/last name pairs with a DOB and StateId
+INSERT INTO Customer.Customer
+	(FirstName, LastName, DateOfBirth, StateId)
+SELECT
+	FN.Data as FirstName,
+	LN.Data as LastName,
+	DateOfBirth = DATEFROMPARTS(dbo.GetRandomInt(1930,2000),dbo.GetRandomInt(1,12),dbo.GetRandomInt(1,28)),
+	States.StateId
+FROM FirstNames FN
+LEFT JOIN LastNames LN ON LN.RowNumber = FN.RowNumber
+LEFT JOIN States ON FN.RandomStateNumber BETWEEN States.StartValue AND States.EndValue;
+
+
+
+-- Set up customer referrals
+-- A customer is referred by another customer if both customers have a matching random
+-- number and are within the same state.
+WITH 
+	-- Each customer is assigned a random number
+	RandomCustomers AS
+	(
+		SELECT
+			CustomerId,
+			StateId,
+			RandomId = dbo.GetRandomInt(1, 300)
+		FROM Customer.Customer
+	),
+	-- Pair customers with their referring customers based on random number
+	ReferredCustomers AS
+	(
+		SELECT
+			Referred  = Referred.CustomerId,
+			Referring = CASE WHEN Referred.CustomerId % 2 = 0 THEN MAX(Referring.CustomerId) ELSE MIN (Referring.CustomerId) END
+		FROM RandomCustomers Referred
+		JOIN RandomCustomers Referring ON
+			Referring.RandomId = Referred.RandomId AND
+			Referring.StateId = Referred.StateId AND
+			Referring.CustomerId < Referred.CustomerId
+		GROUP BY Referred.CustomerId
+	)
+-- Apply referrals to customer table
+UPDATE Customer.Customer
+SET ReferredBy = ReferredCustomers.Referring
+FROM ReferredCustomers
+WHERE Customer.CustomerId = ReferredCustomers.Referred;
+
+
+-- Add home or mobile phone number to most customers
+WITH CustomersWithoutPhones AS
+(
+	SELECT Customer.CustomerId
+	FROM Customer.Customer Customer
+	LEFT JOIN Customer.PhoneNumber PhoneNumber ON 
+		PhoneNumber.CustomerId = Customer.CustomerId AND
+		PhoneNumber.Type IN ('H','M')
+	GROUP BY Customer.CustomerId
+	HAVING COUNT(PhoneNumber.CustomerId) = 0
+)
+INSERT INTO Customer.PhoneNumber
+	(CustomerId, Number, Type)
+SELECT TOP (90) PERCENT
+	CustomerId,
+	CONCAT
+	(
+		dbo.GetRandomInt(2,9),  -- This
+		dbo.GetRandomInt(0,9),  -- isn't
+		dbo.GetRandomInt(0,9),  -- elegant,
+		dbo.GetRandomInt(2,9),	-- please
+		dbo.GetRandomInt(0,9),	-- forgive
+		dbo.GetRandomInt(0,9),	-- me.
+		dbo.GetRandomInt(0,9),
+		dbo.GetRandomInt(0,9),
+		dbo.GetRandomInt(0,9),
+		dbo.GetRandomInt(0,9)
+	),
+	CASE dbo.GetRandomInt(1,3) WHEN 1 THEN 'H' ELSE 'M' END
+FROM CustomersWithoutPhones
+
+---------------------------------------
+---- INVENTORY PURCHASING -------------
+---------------------------------------
+
+END
